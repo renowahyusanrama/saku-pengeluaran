@@ -5,12 +5,16 @@ import '@fontsource/dm-sans/latin-700.css';
 import './style.css';
 import { icon } from './icons.js';
 import { CATEGORIES, STORAGE_KEY, localDate, formatMoney, getPeriod, getPeriodExpenses, getChartData, summarize, validateExpense, normalizeExpenses } from './expenses.js';
+import { resolveDataMode } from './firebase-config.js';
+import { ensureAnonymousSession, subscribeSharedExpenses, saveSharedExpenses } from './firebase.js';
 
 const $ = (selector) => document.querySelector(selector);
 const escapeHTML = (value) => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const dateText = (value, options = {}) => new Intl.DateTimeFormat('id-ID', { day: 'numeric', month: 'long', ...options }).format(new Date(`${value}T12:00:00`));
 let expenses = [];
 let storageProblem = false;
+let dataMode = resolveDataMode();
+let unsubscribeSharedExpenses = null;
 let periodType = 'week';
 let anchor = localDate();
 let editingId = null;
@@ -19,12 +23,40 @@ let toastTimer;
 let undoAction = null;
 let dialogOpener;
 
-try {
-  const stored = localStorage.getItem(STORAGE_KEY);
-  if (stored) expenses = normalizeExpenses(JSON.parse(stored));
-} catch {
-  storageProblem = true;
+async function initDataLayer() {
+  if (dataMode === 'cloud') {
+    try {
+      await ensureAnonymousSession();
+      unsubscribeSharedExpenses = subscribeSharedExpenses((items) => {
+        try {
+          expenses = normalizeExpenses(items);
+          storageProblem = false;
+          render();
+        } catch {
+          showToast('Data cloud tidak valid. Menggunakan data lokal sementara.');
+          storageProblem = true;
+        }
+      }, () => {
+        storageProblem = true;
+        showToast('Sinkron data cloud gagal. Coba muat ulang halaman.');
+      });
+      return;
+    } catch {
+      dataMode = 'local';
+      storageProblem = false;
+      showToast('Koneksi cloud tidak tersedia, pakai penyimpanan lokal.');
+    }
+  }
+
+  try {
+    const stored = localStorage.getItem(STORAGE_KEY);
+    if (stored) expenses = normalizeExpenses(JSON.parse(stored));
+  } catch {
+    storageProblem = true;
+  }
 }
+
+initDataLayer();
 
 $('#app').innerHTML = `
   <a class="skip-link" href="#main">Langsung ke catatan</a>
@@ -79,7 +111,7 @@ $('#app').innerHTML = `
             <button class="button button-primary save-button" id="save-expense" type="submit">${icon('plus')}<span>Simpan pengeluaran</span></button>
             <button class="button cancel-edit" type="button" id="cancel-edit" hidden>Batal mengubah</button>
           </form>
-          <div class="save-note">${icon('lock')}<span>Tersimpan di browser ini, hanya untukmu.</span></div>
+          <div class="save-note">${icon('lock')}<span>${dataMode === 'cloud' ? 'Tersimpan di cloud, bisa dibuka dari perangkat lain.' : 'Tersimpan di browser ini, hanya untukmu.'}</span></div>
         </section>
         <div class="little-note"><span class="note-icon">${icon('leaf')}</span><div><h3>Mulai dari yang kecil.</h3><p>Kopi pagi, ongkos jalan, atau belanja bulanan. Setiap catatan membantumu lebih paham.</p></div></div>
       </aside>
@@ -101,6 +133,18 @@ function showToast(message, action = null) {
 }
 
 function persist(next) {
+  if (dataMode === 'cloud') {
+    saveSharedExpenses(next)
+      .then(() => {
+        expenses = next;
+        render();
+      })
+      .catch(() => {
+        showToast('Data tidak bisa disinkronkan ke cloud.');
+      });
+    return true;
+  }
+
   if (storageProblem) {
     showToast('Data lama belum bisa dibaca. Unduh salinannya lewat Data saya.');
     return false;
@@ -143,7 +187,7 @@ function renderHistory() {
   const items = getPeriodExpenses(expenses, periodType, anchor);
   const filtered = items.filter(item => `${item.description} ${CATEGORIES.find(c => c.id === item.category)?.label}`.toLocaleLowerCase('id-ID').includes(search.toLocaleLowerCase('id-ID')));
   $('#history-count').textContent = items.length;
-  $('#history-footer').innerHTML = `${icon('lock')}<span>Catatan pribadi. Tersimpan otomatis di perangkat ini.</span>`;
+  $('#history-footer').innerHTML = `${icon('lock')}<span>${dataMode === 'cloud' ? 'Catatan bersama. Semua perangkat melihat data yang sama.' : 'Catatan pribadi. Tersimpan otomatis di perangkat ini.'}</span>`;
   if (!filtered.length) {
     $('#history-list').innerHTML = `<div class="empty-state"><span class="empty-icon">${icon(search ? 'search' : 'receipt')}</span><h3>${search ? 'Catatan tidak ditemukan' : 'Belum ada pengeluaran'}</h3><p>${search ? 'Coba kata lain atau pilih periode yang berbeda.' : 'Mulai dari pengeluaran kecil hari ini.<br>Catatanmu akan muncul di sini.'}</p>${!search ? `<button class="text-button" id="start-entry">Catat pengeluaran pertama ${icon('arrow')}</button>` : ''}</div>`;
     if ($('#start-entry')) $('#start-entry').onclick = focusForm;
